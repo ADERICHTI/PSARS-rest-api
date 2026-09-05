@@ -1,10 +1,14 @@
 import requests
 import json
 
-# Replace with your actual local or deployed Render/Koyeb URL
-# Example Local: "http://127.0.0.1:8000/api/v1/telemetry"
-# Example Cloud: "https://your-psars-api.onrender.com/api/v1/telemetry"
+# Local: "http://127.0.0.1:8000/api/v1/telemetry"
+# Deployed (Cloud Run): "https://psars-api-481486286858.europe-west1.run.app/api/v1/telemetry"
 API_URL = "http://127.0.0.1:8000/api/v1/telemetry"
+
+# Per-device key from provision_device.py - psars_node_01's key. The backend
+# rejects any request missing this or carrying the wrong value (401), since
+# /api/v1/telemetry is a public URL once deployed.
+DEVICE_API_KEY = "99f697fe73dc3212fbe5ee86792249dfae58c2b2c9bf128f4bae287e9f33934d"
 
 def send_test_telemetry(device_id: str, lat: float, lng: float, is_panic: bool, battery: float):
     # 1. Construct the payload matching your Pydantic schema
@@ -15,9 +19,10 @@ def send_test_telemetry(device_id: str, lat: float, lng: float, is_panic: bool, 
         "panic": is_panic,
         "battery": battery
     }
-    
+
     headers = {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {DEVICE_API_KEY}",
     }
 
     print(f"Sending payload to {API_URL}...")

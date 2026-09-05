@@ -127,7 +127,7 @@ SECTION 3: PREREQUISITES & TOOLING
 Install before starting:
   - Node.js 20 LTS and npm
   - Java JDK 17 (Android builds)
-  - Android Studio (SDK + emulator), with an AVD created
+  - Android Studio (SDK + emulator), with an AVD created(Although not necessary, if using expo. Same can be said for a significant number of things on this list)
   - Xcode + CocoaPods (macOS only, for iOS builds)
   - Firebase CLI (already installed on this machine): `firebase --version`
   - React Native CLI (no global install needed; used via npx)

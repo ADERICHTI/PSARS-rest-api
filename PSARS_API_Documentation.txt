@@ -1,0 +1,359 @@
+================================================================================
+PSARS API DOCUMENTATION
+Personal Security & Anti-Kidnapping Response System - Backend Reference
+================================================================================
+
+The complete technical contract for the PSARS backend: what it does, how it's
+secured, and what the hardware and frontend teams each need to build against
+it. Live URL:
+
+    https://psars-api-481486286858.europe-west1.run.app
+
+================================================================================
+SECTION 1: BACKEND - PROPERTIES, FEATURES & ENDPOINTS
+================================================================================
+
+--------------------------------------------------------------------------------
+1.1 DEPLOYMENT PROPERTIES
+--------------------------------------------------------------------------------
+
+  Live URL       psars-api-481486286858.europe-west1.run.app
+  Platform       Google Cloud Run, container built via Cloud Build from source
+  Region         europe-west1 - same region as Firestore, minimizing write
+                 latency between telemetry ingestion and database writes
+  Availability   min-instances=1 - no cold-start delay on a panic event
+  Identity       firebase-adminsdk-fbsvc@psars-26.iam.gserviceaccount.com
+                 (attached IAM service account, not a key file)
+  Stack          FastAPI + Uvicorn, firebase-admin (Firestore + FCM),
+                 Termii SMS, Python 3.12
+
+--------------------------------------------------------------------------------
+1.2 ENDPOINT REFERENCE
+--------------------------------------------------------------------------------
+
+  POST /api/v1/telemetry                          [ Authorization required ]
+
+  Receives a location/status ping from a hardware unit. Every request is
+  authenticated against that specific device's own key before anything is
+  written or dispatched.
+
+  HEADERS
+    Content-Type     required   application/json
+    Authorization    required   Bearer <device-key>  (the raw key issued at
+                                 provisioning - see Section 2.1)
+
+  REQUEST BODY
+    device_id   string    required   must match a provisioned device
+    latitude    float     required   decimal degrees
+    longitude   float     required   decimal degrees
+    panic       boolean   optional   default false. true triggers alert dispatch
+    battery     float     optional   percentage, if the unit reports it
+
+  EXAMPLE REQUEST
+
+    POST /api/v1/telemetry
+    Authorization: Bearer 99f697fe73dc...
+    Content-Type: application/json
+
+    {
+      "device_id": "psars_node_01",
+      "latitude": 7.377541,
+      "longitude": 3.947022,
+      "panic": true,
+      "battery": 41.5
+    }
+
+  EXAMPLE RESPONSE (200)
+
+    {
+      "status": "success",
+      "panic_triggered": true
+    }
+
+  RESPONSE CODES
+    200   Telemetry recorded. If panic=true, every emergency contact has
+          already been dispatched to by the time this returns.
+    401   Missing/malformed Authorization header, unknown or unprovisioned
+          device_id, or a key that doesn't match - no data is written in
+          any of these cases.
+    422   Body failed schema validation (wrong type, missing required field).
+    500   Unexpected server-side failure.
+
+  WHAT HAPPENS INTERNALLY, IN ORDER
+    1. Hash the provided key and compare it (constant-time) against the
+       stored hash for device_id. Anything else stops here before any
+       Firestore write happens.
+    2. Append the ping to devices/{device_id}/locations as a permanent
+       history record.
+    3. Merge-update devices/{device_id}.latest_location and last_seen.
+    4. If panic is true: read every document in
+       devices/{device_id}/emergency_contacts. For each contact with an
+       fcm_token, send a high-priority push. For every contact's
+       phone_number, send an SMS with a Google Maps link - regardless of
+       whether that contact has the app.
+
+--------------------------------------------------------------------------------
+1.3 DATA MODEL
+--------------------------------------------------------------------------------
+
+  devices/{device_id}
+    owner_user_id     uid of the account that claimed this unit
+    last_seen         server timestamp of the most recent ping
+    latest_location   { latitude, longitude, panic, battery, timestamp }
+
+  devices/{device_id}/locations/{id}
+    Full ping history, one document per telemetry POST.
+    Written only by this backend - no client, owner included, can write here.
+
+  devices/{device_id}/emergency_contacts/{contactId}
+    name            display name
+    phone_number    E.164 format, e.g. 2348012345678
+    user_id         set only if the contact has a PSARS account
+    fcm_token       set only if they have an account and notification
+                    permission
+    Document ID equals the contact's own uid whenever they have an account -
+    that's what lets Firestore rules grant them read access to the device.
+
+  devices/{device_id}/secrets/auth
+    api_key_hash    SHA-256 hash of the device's key - never the raw value
+    No firestore.rules match covers this path - default-deny. Reachable
+    only from this backend via the admin SDK.
+
+  users/{user_id}
+    full_name, phone_number   profile fields
+    fcm_token                 kept current by the client; a Cloud Function
+                               propagates changes outward to contact records
+    device_id                 the one device this account owns, if any
+
+  FIRESTORE RULES, IN ONE PARAGRAPH
+  A device can be claimed (created) by anyone, exactly once - the first
+  write wins and every later claim attempt on that same ID is rejected.
+  Only the owner can write to a device. Both the owner and any emergency
+  contact linked to it (their own uid as a contact document's ID) can read
+  it and its location history - no one else can. Contact records themselves
+  are owner-managed but self-readable. Everything else is default-denied.
+
+  CLOUD FUNCTIONS (europe-west1, Node.js 20)
+    syncFcmTokenToContacts     Trigger: a user's fcm_token changes.
+                               Propagates the new token to every contact
+                               record referencing that user, across every
+                               device.
+    backfillContactOnSignup    Trigger: a new user signs up.
+                               Matches their phone number against existing
+                               SMS-only contact records, upgrades and
+                               re-keys them to the new account automatically.
+
+--------------------------------------------------------------------------------
+1.4 SECURITY ARCHITECTURE - WHAT'S ACTUALLY IN PLACE
+--------------------------------------------------------------------------------
+
+  - Per-device authentication. Each unit is provisioned with its own random
+    256-bit key (secrets.token_hex(32)). Only its SHA-256 hash is ever
+    stored; comparison uses hmac.compare_digest to resist timing attacks.
+    A leaked key compromises exactly one device, never the fleet.
+
+  - No credential file in production. The deployed container carries no
+    service-account key at all - Cloud Run authenticates to Firebase via
+    its attached IAM identity (Application Default Credentials).
+
+  - Secret Manager for third-party keys. The Termii SMS API key is
+    injected at runtime from Secret Manager, not stored as a plaintext
+    environment variable or in source.
+
+  - Transport security. Cloud Run terminates TLS automatically; there is
+    no plaintext HTTP path to this service.
+
+  - Least-privilege data access. Firestore rules scope every read/write to
+    the specific owner or linked contact - verified deployed and tested
+    against both allowed and denied cases.
+
+  - Always warm. A pinned minimum instance means a panic event is never
+    delayed by a cold start.
+
+--------------------------------------------------------------------------------
+1.5 SECURITY SCORECARD
+--------------------------------------------------------------------------------
+
+  An honest read, not a marketing one - there's no such thing as a 100%
+  score in security. This is what's solid today and what's still open.
+
+  TRANSPORT SECURITY .................................... STRONG
+    TLS enforced end-to-end by Cloud Run; nothing reaches this service in
+    plaintext.
+
+  ENDPOINT AUTHENTICATION ................................ STRONG
+    Per-device hashed key, constant-time compare. Gap: no rate limiting or
+    lockout yet on repeated failed attempts.
+
+  CREDENTIAL HANDLING ..................................... STRONG
+    No private key shipped in the container; backend runs as an attached
+    IAM service account.
+
+  FIRESTORE ACCESS CONTROL ................................ STRONG
+    Owner/contact scoping deployed and verified against allowed and denied
+    cases alike.
+
+  PHYSICAL TAMPER-RESISTANCE .............................. GAP
+    ESP32 flash is unencrypted by default - a key is extractable with
+    physical access and esptool. Needs flash encryption + secure boot.
+    Relevant specifically because this product's threat model includes
+    physical device seizure.
+
+  ABUSE / RATE LIMITING ................................... PARTIAL
+    A valid key can still be replayed or spammed - no throttling
+    implemented on the endpoint yet.
+
+  OBSERVABILITY & ALERTING ................................ PARTIAL
+    Only console logging today - nothing pages anyone if a device starts
+    failing auth repeatedly, which could mean a lost or compromised unit.
+
+  SMS DELIVERY (TERMII) ................................... BLOCKED
+    Sender ID not yet approved on the Termii account - SMS silently fails
+    until that's resolved. This is a safety gap, not just a security one:
+    push notifications alone are the only channel working right now.
+
+================================================================================
+SECTION 2: WHAT'S EXPECTED OF THE HARDWARE & FRONTEND TEAMS
+================================================================================
+
+The backend enforces its half of the contract; here's the other half each
+team owns.
+
+--------------------------------------------------------------------------------
+2.1 HARDWARE TEAM (Firmware - ESP32 + SIM800L)
+--------------------------------------------------------------------------------
+
+  1. Implement the exact request contract.
+     POST to the URL above over the SIM800L's GPRS connection, with both
+     headers and the JSON body exactly as specified in Section 1.2 - the
+     backend validates strictly and returns 422 on any schema mismatch.
+
+  2. Get a key for every unit before it ships.
+     Each physical device needs its own key, generated by running the
+     provisioning script (provision_device.py) once per device_id. Request
+     this from the backend team per unit or per batch - a device with no
+     provisioned key gets 401 on every request, permanently, until it's
+     provisioned.
+
+  3. Store the key in flash/NVS, never in source or logs.
+     The raw key is shown exactly once at provisioning time. It must be
+     written to the device's own storage at flash time and never printed,
+     logged, or transmitted anywhere except inside the Authorization
+     header of its own telemetry requests.
+
+  4. Assign each unit a unique, non-guessable device_id.
+     Avoid sequential IDs like psars_node_01, _02 for real production
+     units - prefer a random or serial-derived identifier so device IDs
+     can't be enumerated.
+
+  5. Handle every response code deliberately.
+     200 = delivered.
+     401 = this unit is misconfigured or unprovisioned - treat as a
+           firmware/provisioning fault, not a network retry.
+     422 = a firmware bug in the payload.
+     5xx = transient; retry with backoff.
+
+  6. Decide and document a ping interval.
+     The backend enforces no fixed frequency - pick a periodic heartbeat
+     (e.g. every few minutes) and fire an immediate, retried-until-
+     acknowledged request the instant the panic control is triggered,
+     independent of the regular heartbeat cycle.
+
+  7. Plan for flash encryption + secure boot.
+     Not yet implemented - flagged in the scorecard above as the main open
+     physical-security gap, and directly relevant given this device's
+     real-world threat model includes it being physically taken.
+
+--------------------------------------------------------------------------------
+2.2 FRONTEND / MOBILE TEAM (React Native - Firebase)
+--------------------------------------------------------------------------------
+
+  1. Start from the existing build guide.
+     A complete reference - screens, services, navigation, dependencies -
+     already exists for this app: PSARS_ReactNative_Client_Guide.txt.
+
+  2. Normalize phone numbers to E.164.
+     Contact matching is a plain string comparison against
+     users/{uid}.phone_number - any formatting inconsistency silently
+     breaks the auto-link behavior described below.
+
+  3. Treat device claiming as first-come, permanent.
+     Claiming a device is a Firestore create that only succeeds if nobody
+     owns it yet. Handle the failure case specifically - a
+     permission-denied here means "already connected to another account,"
+     not a generic error.
+
+  4. Look up accounts when adding a contact.
+     If the phone number being added already belongs to a PSARS account,
+     denormalize its user_id and fcm_token into the contact record
+     immediately, keyed by that account's own uid. Otherwise store just
+     name + phone - a Cloud Function upgrades it automatically the moment
+     that number signs up.
+
+  5. Keep fcm_token current, nothing else.
+     The app's only job is to write a fresh token to its own
+     users/{uid} document on refresh - propagation to every linked
+     contact record is handled server-side.
+
+  6. Handle push notifications in all three app states.
+     Foreground, background, and killed all need to route a tapped panic
+     alert to a live map view - the app is allowed to read a linked
+     device's real-time location, not just the static coordinates carried
+     in the notification payload.
+
+  7. Never expect to touch secrets/auth.
+     That path is intentionally unreachable from any client. If a write
+     there is ever needed, that's a sign something is being built in the
+     wrong layer.
+
+================================================================================
+SUMMARY: WHAT'S LIVE TODAY, AND WHAT'S NEXT
+================================================================================
+
+--------------------------------------------------------------------------------
+SHIPPED
+--------------------------------------------------------------------------------
+
+  [x] Backend deployed to Cloud Run, europe-west1, always warm
+  [x] Per-device authentication, hashed keys - one compromised unit does
+      not compromise the fleet
+  [x] No credential file in production - IAM-based backend identity
+  [x] Firestore rules: owner-claim + linked-contact live viewing
+  [x] Two Cloud Functions keeping contact records in sync automatically
+  [x] Full React Native build guide, ready to implement against
+
+--------------------------------------------------------------------------------
+ROADMAP
+--------------------------------------------------------------------------------
+
+  P0  Register a Termii sender ID
+      SMS is currently non-functional in production. Until this is
+      approved, push notifications are the only working alert channel -
+      anyone without the app receives nothing.
+
+  P1  ESP32 flash encryption + secure boot
+      Closes the physical key-extraction gap flagged in the scorecard.
+      Owned by the hardware team.
+
+  P1  Rate limiting on the telemetry endpoint
+      A valid key can currently be replayed without limit. Add per-device
+      throttling.
+
+  P2  Structured logging & failure alerting
+      Nothing currently pages anyone on repeated auth failures for a
+      device - a real signal for a lost or compromised unit.
+
+  P2  Documented key rotation procedure
+      No process yet for revoking and reissuing a specific device's key
+      if it's ever suspected leaked.
+
+  P3  Build the React Native app
+      The guide is complete; the app itself hasn't been scaffolded yet.
+
+  P3  Multi-device-per-user support
+      Current schema allows exactly one device per account - revisit if
+      the product needs more.
+
+================================================================================
+END OF DOCUMENT
+================================================================================

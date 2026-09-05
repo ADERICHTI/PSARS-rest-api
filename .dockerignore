@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+service-account-key.json
+firestore.rules
+firestore.indexes.json
+.firebaserc
+firebase.json
+Cloud-functions/
+fcm-tester/
+test.py
+provision_device.py
+PSARS_ReactNative_Client_Guide.txt
