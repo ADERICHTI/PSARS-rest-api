@@ -66,11 +66,8 @@ async def receive_telemetry(data: TelemetryData):
 
         # Step B: Trigger Panic Alerts (FCM + Termii) for every emergency contact
         if data.panic:
-            device_doc = db.collection("devices").document(data.device_id).get()
-
-            emergency_contacts = []
-            if device_doc.exists:
-                emergency_contacts = device_doc.to_dict().get("emergency_contacts", [])
+            contacts_ref = db.collection("devices").document(data.device_id).collection("emergency_contacts")
+            emergency_contacts = [doc.to_dict() for doc in contacts_ref.stream()]
 
             for contact in emergency_contacts:
                 contact_name = contact.get("name", "contact")

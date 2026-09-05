@@ -20,6 +20,14 @@ service cloud.firestore {
 
       allow delete: if false;
 
+      // Emergency contacts: only the owner can view/manage their own device's
+      // contact list from the client. Cloud Functions use the admin SDK and
+      // bypass these rules entirely when syncing fcm_token values.
+      match /emergency_contacts/{contactId} {
+        allow read, write: if request.auth != null
+          && get(/databases/$(database)/documents/devices/$(deviceId)).data.owner_user_id == request.auth.uid;
+      }
+
       // Historical location pings: written only by the backend (admin SDK bypasses
       // rules entirely), readable client-side only by the owning user.
       match /locations/{locationId} {
