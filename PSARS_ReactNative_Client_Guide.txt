@@ -1,0 +1,1677 @@
+================================================================================
+PSARS COMPANION APP - REACT NATIVE CLIENT BUILD GUIDE
+Personal Security & Anti-Kidnapping Response System
+================================================================================
+
+This document is a complete, standalone reference for building the React
+Native companion mobile app that pairs with a PSARS hardware unit (ESP32 +
+SIM800L) through the existing Firebase backend (project: psars-26) and
+FastAPI telemetry service. It assumes nothing has been built yet on the
+client side and covers everything: architecture, tooling, dependencies,
+native configuration, folder structure, full source code, workflow/logic,
+and known limitations.
+
+================================================================================
+SECTION 1: SYSTEM RECAP - WHAT ALREADY EXISTS (BACKEND)
+================================================================================
+
+Before touching the app, understand what it is talking to. This already
+exists and is deployed:
+
+1. FastAPI backend (P-SARS-API/main.py)
+   - POST /api/v1/telemetry - hardware ingestion endpoint. Not called by the
+     mobile app. The ESP32 posts here directly over cellular data.
+   - On panic=true, it reads devices/{device_id}/emergency_contacts and
+     sends an FCM push + Termii SMS to every contact found there.
+
+2. Firestore (project: psars-26, database in europe-west1)
+   Collections:
+
+   devices/{device_id}
+     - owner_user_id: string       (uid of the account that claimed this unit)
+     - last_seen: Timestamp
+     - latest_location: { latitude, longitude, panic, battery, timestamp }
+
+   devices/{device_id}/locations/{locationId}
+     - { latitude, longitude, panic, battery, timestamp }
+     - Historical ping log, written only by the backend (admin SDK).
+
+   devices/{device_id}/emergency_contacts/{contactId}
+     - name: string
+     - phone_number: string          (E.164 format, e.g. "2348012345678")
+     - user_id: string | null        (set only if the contact has an account)
+     - fcm_token: string | null      (set only if the contact has an account)
+     This is what the app writes to when the device owner adds a contact.
+
+   users/{user_id}
+     - user_id, full_name, phone_number, fcm_token
+     - device_id: string | null      (the ONE device this account owns/paired)
+
+3. Firestore Security Rules (firestore.rules) - already deployed
+   - devices/{deviceId}:
+       create: allowed only if the document does not exist yet, and only
+               if you are writing yourself as owner_user_id. This is the
+               device "claim" - first account to claim a device_id wins,
+               permanently, unless manually reset in the console.
+       update: allowed only to the current owner_user_id.
+       read: allowed to the owner, AND to any user with a matching
+             emergency_contacts/{uid} record under that device (see below) -
+             this is what lets a linked contact view the live map too.
+   - devices/{deviceId}/emergency_contacts/{contactId}:
+       read: the owner can read the whole list; a contact can read only
+             their own record (by uid-as-doc-ID, or via a collectionGroup
+             query matched on user_id) - this is how the app discovers
+             "which devices am I a contact for."
+       write: allowed only to the device's owner.
+   - devices/{deviceId}/locations/{locationId}:
+       read: same as the device doc - owner or linked contact.
+       write: blocked entirely (backend-only, via the admin SDK which
+              bypasses rules).
+   - users/{userId}:
+       read/write: allowed only to that same uid.
+
+   HOW A CONTACT BECOMES "LINKED": their emergency_contacts document's ID
+   must equal their own uid. contactsService.addContact() does this
+   immediately when the contact already has an account at add-time. If they
+   don't yet, the record starts under an auto-generated ID (SMS-only), and
+   the backfillContactOnSignup Cloud Function re-keys it to their uid the
+   moment they sign up (delete old ID, create at new uid-keyed ID) - at
+   which point the read-access rule above starts passing for them
+   automatically, with no app-side action required.
+
+4. Cloud Functions (Cloud-functions/index.js, europe-west1) - already deployed
+   - syncFcmTokenToContacts: when a user's own fcm_token changes, propagates
+     the new value to every emergency_contacts record across all devices
+     that references their user_id. The app never needs to do this itself -
+     just keep users/{uid}.fcm_token current and this handles the rest.
+   - backfillContactOnSignup: when a new user document is created, matches
+     their phone_number against existing SMS-only contact records and
+     upgrades those records with the new user_id + fcm_token automatically.
+
+5. Firebase project reference
+   - Project ID: psars-26
+   - Firestore location: europe-west1
+   - Functions region: europe-west1
+   You will register the mobile app(s) (Android/iOS) under this same
+   project in the Firebase console - see Section 4.
+
+================================================================================
+SECTION 2: HIGH-LEVEL APP RESPONSIBILITIES
+================================================================================
+
+The companion app has exactly these jobs:
+
+  A. Authenticate the user (phone number based, since phone_number is the
+     key used everywhere for contact matching).
+  B. Maintain users/{uid} with full_name, phone_number, and a live fcm_token.
+  C. Let the user "claim" a device by entering/scanning its device_id
+     (writes devices/{device_id} with owner_user_id = uid).
+  D. If the user owns a device: show its live location/status on a map,
+     show battery, show a big panic banner when latest_location.panic is
+     true, and show location history.
+  E. If the user owns a device: manage its emergency_contacts subcollection
+     (add/remove contacts by name + phone number).
+  F. Receive and react to FCM push notifications (panic alerts) - whether
+     the user owns a device or is only listed as someone else's contact.
+  G. Let a user view the LIVE map of any device they're a linked emergency
+     contact on - not just a static point from a push notification, but
+     the same real-time Firestore feed the owner sees. Works from a
+     dedicated "devices I'm watching" list, and from tapping a panic
+     notification (which upgrades from a static pin to a live feed the
+     instant Firestore responds).
+
+================================================================================
+SECTION 3: PREREQUISITES & TOOLING
+================================================================================
+
+Install before starting:
+  - Node.js 20 LTS and npm
+  - Java JDK 17 (Android builds)
+  - Android Studio (SDK + emulator), with an AVD created
+  - Xcode + CocoaPods (macOS only, for iOS builds)
+  - Firebase CLI (already installed on this machine): `firebase --version`
+  - React Native CLI (no global install needed; used via npx)
+
+This guide uses the BARE React Native CLI (not Expo Go), because
+@react-native-firebase's native modules (auth, firestore, messaging) are
+not supported inside Expo Go and require either bare RN or an Expo
+custom dev client. Bare RN is the simpler, more predictable path for this
+guide.
+
+Check your setup with:
+  npx react-native doctor
+
+================================================================================
+SECTION 4: FIREBASE CONSOLE SETUP (DO THIS BEFORE WRITING CODE)
+================================================================================
+
+1. Open the Firebase console for project "psars-26".
+
+2. Register an Android app:
+   - Project settings -> Add app -> Android
+   - Package name: com.psars.companion (use this exact value below, or pick
+     your own and keep it consistent everywhere it appears in this guide)
+   - Download google-services.json -> you'll place this at:
+       android/app/google-services.json
+
+3. (If building iOS) Register an iOS app:
+   - Bundle ID: com.psars.companion
+   - Download GoogleService-Info.plist -> place at:
+       ios/PSARSCompanion/GoogleService-Info.plist
+
+4. Enable Phone authentication:
+   - Authentication -> Sign-in method -> Phone -> Enable
+   - Android: Firebase Phone Auth needs SHA-1/SHA-256 fingerprints for
+     Play Integrity verification (replaces the old SafetyNet flow).
+     Get your debug fingerprint with:
+       cd android && ./gradlew signingReport
+     Copy the SHA-1 and SHA-256 under the "debug" variant into:
+       Project settings -> Your Android app -> Add fingerprint
+     You will need to repeat this with your RELEASE keystore's fingerprints
+     before shipping a production build, or phone auth will fail silently
+     in release builds.
+
+5. Cloud Messaging:
+   - No extra manual server-key setup needed for Android; FCM works out of
+     the box once google-services.json is in place.
+   - iOS requires an APNs Authentication Key uploaded under
+     Project settings -> Cloud Messaging -> Apple app configuration, plus
+     Push Notifications + Background Modes ("Remote notifications")
+     capabilities enabled in Xcode. Push notifications do not work in the
+     iOS Simulator - you need a physical device for FCM/APNs testing.
+
+================================================================================
+SECTION 5: PROJECT SCAFFOLDING
+================================================================================
+
+  npx @react-native-community/cli init PSARSCompanion
+  cd PSARSCompanion
+
+Place the two config files downloaded above:
+  android/app/google-services.json
+  ios/PSARSCompanion/GoogleService-Info.plist     (macOS only)
+
+================================================================================
+SECTION 6: DEPENDENCIES
+================================================================================
+
+Install in this order:
+
+  npm install @react-native-firebase/app
+  npm install @react-native-firebase/auth
+  npm install @react-native-firebase/firestore
+  npm install @react-native-firebase/messaging
+  npm install @react-navigation/native @react-navigation/native-stack
+  npm install react-native-screens react-native-safe-area-context
+  npm install react-native-gesture-handler
+  npm install react-native-maps
+  npm install react-native-camera-kit
+  npm install @notifee/react-native
+  npm install @react-native-async-storage/async-storage
+
+  # iOS only
+  cd ios && pod install && cd ..
+
+What each one is for:
+  @react-native-firebase/*   Native Firebase SDK bindings (app/auth/
+                              firestore/messaging). This is the standard,
+                              production-grade way to use Firebase in RN -
+                              NOT the "firebase" web JS package, which lacks
+                              reliable background push support on RN.
+  @react-navigation/*         Screen stack navigation.
+  react-native-screens /
+  safe-area-context           Required peer deps for React Navigation.
+  react-native-gesture-handler Required by navigation gesture handling.
+  react-native-maps           Live location map + markers.
+  react-native-camera-kit     QR code scanning for device pairing.
+  @notifee/react-native       Rich local notification display, custom
+                              Android channels, foreground alert UI, and
+                              tap-to-open handling for panic alerts.
+  @react-native-async-storage AsyncStorage, used to cache "have I completed
+                              onboarding" style flags locally.
+
+================================================================================
+SECTION 7: NATIVE CONFIGURATION
+================================================================================
+
+--- android/build.gradle ---
+Add the Google services classpath to the top-level buildscript dependencies:
+
+  buildscript {
+    dependencies {
+      classpath 'com.google.gms:google-services:4.4.2'
+    }
+  }
+
+--- android/app/build.gradle ---
+Add this line at the very bottom of the file:
+
+  apply plugin: 'com.google.gms.google-services'
+
+--- android/app/src/main/AndroidManifest.xml ---
+Add these permissions above the <application> tag:
+
+  <uses-permission android:name="android.permission.INTERNET" />
+  <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+  <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+  <uses-permission android:name="android.permission.CAMERA" />
+
+Inside <application>, add the metadata for a default notification channel
+and icon color used by @notifee/@react-native-firebase when the app is
+killed:
+
+  <meta-data
+      android:name="com.google.firebase.messaging.default_notification_channel_id"
+      android:value="panic_alerts" />
+
+--- ios/PSARSCompanion/Info.plist ---
+Add camera and location usage descriptions:
+
+  <key>NSCameraUsageDescription</key>
+  <string>Used to scan your PSARS device's pairing QR code.</string>
+  <key>NSLocationWhenInUseUsageDescription</key>
+  <string>Used to show your device's location on the map.</string>
+
+In Xcode: Signing & Capabilities -> add "Push Notifications" and
+"Background Modes" (check "Remote notifications").
+
+================================================================================
+SECTION 8: FOLDER STRUCTURE
+================================================================================
+
+PSARSCompanion/
+  index.js                          <- registers background FCM handler
+  App.js                            <- navigation root
+  src/
+    config/
+      constants.js
+    services/
+      firebase.js
+      authService.js
+      deviceService.js
+      contactsService.js
+      notificationService.js
+    navigation/
+      RootNavigator.js
+    screens/
+      SplashScreen.js
+      PhoneSignInScreen.js
+      OtpVerificationScreen.js
+      ProfileSetupScreen.js
+      DevicePairingScreen.js
+      NoDeviceHomeScreen.js
+      HomeDashboardScreen.js
+      LocationHistoryScreen.js
+      EmergencyContactsScreen.js
+      AddContactScreen.js
+      WatchedDevicesListScreen.js
+      WatchedDeviceMapScreen.js
+      AlertScreen.js
+      SettingsScreen.js
+    components/
+      PanicBanner.js
+      StatusPill.js
+      ContactListItem.js
+      DeviceMapView.js
+  android/ ...
+  ios/ ...
+
+================================================================================
+SECTION 9: CORE SERVICES - FULL CODE
+================================================================================
+
+--- FILE: src/config/constants.js ---
+
+  export const CONTACT_CHANNEL_ID = 'panic_alerts';
+  export const E164_REGEX = /^\+?[1-9]\d{7,14}$/;
+
+--- FILE: src/services/firebase.js ---
+
+  // @react-native-firebase auto-initializes from google-services.json /
+  // GoogleService-Info.plist - there is nothing to call here manually.
+  // This file exists purely so every other file imports Firebase modules
+  // from one place.
+
+  import auth from '@react-native-firebase/auth';
+  import firestore from '@react-native-firebase/firestore';
+  import messaging from '@react-native-firebase/messaging';
+
+  export { auth, firestore, messaging };
+
+--- FILE: src/services/authService.js ---
+
+  import { auth, firestore } from './firebase';
+
+  let confirmationResult = null;
+
+  export async function sendOtp(phoneNumberE164) {
+    confirmationResult = await auth().signInWithPhoneNumber(phoneNumberE164);
+    return confirmationResult;
+  }
+
+  export async function confirmOtp(code) {
+    if (!confirmationResult) {
+      throw new Error('No OTP request in progress. Call sendOtp first.');
+    }
+    const userCredential = await confirmationResult.confirm(code);
+    return userCredential.user;
+  }
+
+  export async function ensureUserDocument({ uid, phoneNumber }) {
+    const ref = firestore().collection('users').doc(uid);
+    const snap = await ref.get();
+    if (!snap.exists) {
+      await ref.set({
+        user_id: uid,
+        phone_number: phoneNumber,
+        full_name: '',
+        fcm_token: null,
+        device_id: null,
+      });
+    }
+    return ref;
+  }
+
+  export async function completeProfile(uid, fullName) {
+    await firestore().collection('users').doc(uid).update({
+      full_name: fullName,
+    });
+  }
+
+  export function currentUser() {
+    return auth().currentUser;
+  }
+
+  export function onAuthStateChanged(callback) {
+    return auth().onAuthStateChanged(callback);
+  }
+
+  export async function signOut() {
+    await auth().signOut();
+  }
+
+--- FILE: src/services/deviceService.js ---
+
+  import { firestore } from './firebase';
+  import firestoreNS from '@react-native-firebase/firestore';
+
+  // Attempts to claim a device_id for the current user. Relies entirely on
+  // firestore.rules to enforce "first claim wins" - if the device doc
+  // already exists with a different owner_user_id, this create() call is
+  // rejected by the server with a permission-denied error.
+  export async function claimDevice(deviceId, uid) {
+    const deviceRef = firestore().collection('devices').doc(deviceId);
+
+    try {
+      await deviceRef.create({
+        owner_user_id: uid,
+        last_seen: firestoreNS.FieldValue.serverTimestamp(),
+        latest_location: null,
+      });
+    } catch (err) {
+      if (err.code === 'firestore/already-exists') {
+        throw new Error('This device is already registered.');
+      }
+      if (err.code === 'firestore/permission-denied') {
+        throw new Error('This device is already connected to another account.');
+      }
+      throw err;
+    }
+
+    await firestore().collection('users').doc(uid).update({ device_id: deviceId });
+    return deviceId;
+  }
+
+  export function listenToDevice(deviceId, onChange) {
+    return firestore()
+      .collection('devices')
+      .doc(deviceId)
+      .onSnapshot(
+        (snap) => onChange(snap.exists ? snap.data() : null),
+        (err) => console.warn('listenToDevice error:', err),
+      );
+  }
+
+  export function listenToLocationHistory(deviceId, onChange, limit = 50) {
+    return firestore()
+      .collection('devices')
+      .doc(deviceId)
+      .collection('locations')
+      .orderBy('timestamp', 'desc')
+      .limit(limit)
+      .onSnapshot(
+        (snap) => onChange(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
+        (err) => console.warn('listenToLocationHistory error:', err),
+      );
+  }
+
+--- FILE: src/services/contactsService.js ---
+
+  import { firestore } from './firebase';
+
+  export function listenToContacts(deviceId, onChange) {
+    return firestore()
+      .collection('devices')
+      .doc(deviceId)
+      .collection('emergency_contacts')
+      .onSnapshot(
+        (snap) => onChange(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
+        (err) => console.warn('listenToContacts error:', err),
+      );
+  }
+
+  // If the contact already has an account, look them up by phone_number and
+  // denormalize their user_id + fcm_token immediately. Otherwise store just
+  // the name + phone_number - backfillContactOnSignup (Cloud Function) will
+  // upgrade the record automatically if/when that number signs up later.
+  export async function addContact(deviceId, { name, phoneNumber }) {
+    const existing = await firestore()
+      .collection('users')
+      .where('phone_number', '==', phoneNumber)
+      .limit(1)
+      .get();
+
+    const payload = { name, phone_number: phoneNumber };
+
+    if (!existing.empty) {
+      const userDoc = existing.docs[0];
+      payload.user_id = userDoc.id;
+      payload.fcm_token = userDoc.data().fcm_token || null;
+    } else {
+      payload.user_id = null;
+      payload.fcm_token = null;
+    }
+
+    // Use the contact's own uid as the document ID when known - this is
+    // what would let a future rules change grant that contact read access
+    // to the device (see Section 16). When unknown, let Firestore
+    // auto-generate an ID.
+    const contactsRef = firestore()
+      .collection('devices')
+      .doc(deviceId)
+      .collection('emergency_contacts');
+
+    if (payload.user_id) {
+      await contactsRef.doc(payload.user_id).set(payload);
+    } else {
+      await contactsRef.add(payload);
+    }
+  }
+
+  export async function removeContact(deviceId, contactId) {
+    await firestore()
+      .collection('devices')
+      .doc(deviceId)
+      .collection('emergency_contacts')
+      .doc(contactId)
+      .delete();
+  }
+
+  // Devices the current user can view because they're listed as an
+  // emergency contact on them (not because they own them). Works via a
+  // collectionGroup query across every device's emergency_contacts
+  // subcollection - firestore.indexes.json enables this query, and
+  // firestore.rules only returns documents where this uid is the contact's
+  // own record (owner-only contact records for OTHER people are filtered
+  // out server-side, not just hidden client-side).
+  export function listenToWatchedDevices(uid, onChange) {
+    return firestore()
+      .collectionGroup('emergency_contacts')
+      .where('user_id', '==', uid)
+      .onSnapshot(
+        (snap) => {
+          const devices = snap.docs.map((d) => ({
+            deviceId: d.ref.parent.parent.id,
+            contactId: d.id,
+            ...d.data(),
+          }));
+          onChange(devices);
+        },
+        (err) => console.warn('listenToWatchedDevices error:', err),
+      );
+  }
+
+--- FILE: src/services/notificationService.js ---
+
+  import notifee, { AndroidImportance, AndroidCategory, EventType } from '@notifee/react-native';
+  import { messaging, firestore } from './firebase';
+  import { CONTACT_CHANNEL_ID } from '../config/constants';
+
+  export async function setupNotificationChannel() {
+    await notifee.createChannel({
+      id: CONTACT_CHANNEL_ID,
+      name: 'Panic Alerts',
+      importance: AndroidImportance.HIGH,
+      sound: 'default',
+      vibration: true,
+    });
+  }
+
+  export async function requestPermissionsAndRegisterToken(uid) {
+    await notifee.requestPermission();
+    const authStatus = await messaging().requestPermission();
+    const enabled =
+      authStatus === messaging.AuthorizationStatus.AUTHORIZED ||
+      authStatus === messaging.AuthorizationStatus.PROVISIONAL;
+
+    if (!enabled) return null;
+
+    const token = await messaging().getToken();
+    await firestore().collection('users').doc(uid).update({ fcm_token: token });
+
+    // Keep Firestore in sync if the token ever rotates while the app is
+    // open (reinstall, app data clear, etc). syncFcmTokenToContacts (Cloud
+    // Function) then propagates this to every device's emergency_contacts
+    // record that references this user - no client action needed there.
+    messaging().onTokenRefresh(async (newToken) => {
+      await firestore().collection('users').doc(uid).update({ fcm_token: newToken });
+    });
+
+    return token;
+  }
+
+  // Foreground messages: RNFirebase does not show a system notification by
+  // itself while the app is in the foreground, so we display one manually
+  // via notifee, styled as a high-priority panic alert.
+  export function registerForegroundHandler(navigationRef) {
+    return messaging().onMessage(async (remoteMessage) => {
+      await displayPanicNotification(remoteMessage);
+    });
+  }
+
+  async function displayPanicNotification(remoteMessage) {
+    const { title, body } = remoteMessage.notification || {};
+    const data = remoteMessage.data || {};
+
+    await notifee.displayNotification({
+      title: title || 'PSARS EMERGENCY ALERT',
+      body: body || 'A panic alert was triggered.',
+      data,
+      android: {
+        channelId: CONTACT_CHANNEL_ID,
+        category: AndroidCategory.ALARM,
+        importance: AndroidImportance.HIGH,
+        pressAction: { id: 'default' },
+      },
+    });
+  }
+
+  // Handles the user tapping a notification (foreground via notifee, or
+  // background/killed via RNFirebase) and routes them to AlertScreen with
+  // the lat/lng/device_id payload.
+  export function registerNotificationOpenHandlers(navigationRef) {
+    notifee.onForegroundEvent(({ type, detail }) => {
+      if (type === EventType.PRESS) {
+        navigateToAlert(navigationRef, detail.notification?.data);
+      }
+    });
+
+    messaging().onNotificationOpenedApp((remoteMessage) => {
+      navigateToAlert(navigationRef, remoteMessage.data);
+    });
+
+    messaging()
+      .getInitialNotification()
+      .then((remoteMessage) => {
+        if (remoteMessage) {
+          navigateToAlert(navigationRef, remoteMessage.data);
+        }
+      });
+  }
+
+  function navigateToAlert(navigationRef, data) {
+    if (!data || !navigationRef?.isReady()) return;
+    navigationRef.navigate('Alert', {
+      lat: parseFloat(data.lat),
+      lng: parseFloat(data.lng),
+      deviceId: data.device_id,
+    });
+  }
+
+================================================================================
+SECTION 10: BACKGROUND MESSAGE HANDLER (index.js)
+================================================================================
+
+This MUST be registered outside of any React component, at the top level
+of index.js, or Android will not wake the app for background/killed-state
+pushes.
+
+--- FILE: index.js ---
+
+  import { AppRegistry } from 'react-native';
+  import messaging from '@react-native-firebase/messaging';
+  import App from './App';
+  import { name as appName } from './app.json';
+
+  messaging().setBackgroundMessageHandler(async (remoteMessage) => {
+    // No UI work here - the OS already shows the notification tray entry
+    // from the FCM payload's "notification" block. This handler exists so
+    // you can do background data work (e.g. local logging) if needed later.
+    console.log('Background FCM message:', remoteMessage);
+  });
+
+  AppRegistry.registerComponent(appName, () => App);
+
+================================================================================
+SECTION 11: NAVIGATION
+================================================================================
+
+--- FILE: src/navigation/RootNavigator.js ---
+
+  import React, { useEffect, useRef, useState } from 'react';
+  import { NavigationContainer, createNavigationContainerRef } from '@react-navigation/native';
+  import { createNativeStackNavigator } from '@react-navigation/native-stack';
+
+  import { onAuthStateChanged, currentUser } from '../services/authService';
+  import { firestore } from '../services/firebase';
+
+  import SplashScreen from '../screens/SplashScreen';
+  import PhoneSignInScreen from '../screens/PhoneSignInScreen';
+  import OtpVerificationScreen from '../screens/OtpVerificationScreen';
+  import ProfileSetupScreen from '../screens/ProfileSetupScreen';
+  import DevicePairingScreen from '../screens/DevicePairingScreen';
+  import NoDeviceHomeScreen from '../screens/NoDeviceHomeScreen';
+  import HomeDashboardScreen from '../screens/HomeDashboardScreen';
+  import LocationHistoryScreen from '../screens/LocationHistoryScreen';
+  import EmergencyContactsScreen from '../screens/EmergencyContactsScreen';
+  import AddContactScreen from '../screens/AddContactScreen';
+  import WatchedDevicesListScreen from '../screens/WatchedDevicesListScreen';
+  import WatchedDeviceMapScreen from '../screens/WatchedDeviceMapScreen';
+  import AlertScreen from '../screens/AlertScreen';
+  import SettingsScreen from '../screens/SettingsScreen';
+
+  export const navigationRef = createNavigationContainerRef();
+
+  const Stack = createNativeStackNavigator();
+
+  export default function RootNavigator() {
+    const [booting, setBooting] = useState(true);
+    const [user, setUser] = useState(null);
+    const [profile, setProfile] = useState(null);
+
+    useEffect(() => {
+      const unsubAuth = onAuthStateChanged(async (u) => {
+        setUser(u);
+        if (!u) {
+          setProfile(null);
+          setBooting(false);
+          return;
+        }
+        const unsubProfile = firestore()
+          .collection('users')
+          .doc(u.uid)
+          .onSnapshot((snap) => {
+            setProfile(snap.exists ? snap.data() : null);
+            setBooting(false);
+          });
+        return unsubProfile;
+      });
+      return unsubAuth;
+    }, []);
+
+    if (booting) return <SplashScreen />;
+
+    return (
+      <NavigationContainer ref={navigationRef}>
+        <Stack.Navigator screenOptions={{ headerShown: false }}>
+          {!user ? (
+            <>
+              <Stack.Screen name="PhoneSignIn" component={PhoneSignInScreen} />
+              <Stack.Screen name="OtpVerification" component={OtpVerificationScreen} />
+            </>
+          ) : !profile?.full_name ? (
+            <Stack.Screen name="ProfileSetup" component={ProfileSetupScreen} />
+          ) : !profile?.device_id ? (
+            <>
+              <Stack.Screen name="NoDeviceHome" component={NoDeviceHomeScreen} />
+              <Stack.Screen name="DevicePairing" component={DevicePairingScreen} />
+              <Stack.Screen name="Settings" component={SettingsScreen} />
+            </>
+          ) : (
+            <>
+              <Stack.Screen name="Home" component={HomeDashboardScreen} />
+              <Stack.Screen name="LocationHistory" component={LocationHistoryScreen} />
+              <Stack.Screen name="EmergencyContacts" component={EmergencyContactsScreen} />
+              <Stack.Screen name="AddContact" component={AddContactScreen} />
+              <Stack.Screen name="Settings" component={SettingsScreen} />
+            </>
+          )}
+          {/* Reachable regardless of auth branch above: someone can own a
+              device AND separately be a contact on someone else's, and a
+              push notification can arrive no matter which branch is active. */}
+          <Stack.Screen name="WatchedDevices" component={WatchedDevicesListScreen} />
+          <Stack.Screen name="WatchedDeviceMap" component={WatchedDeviceMapScreen} />
+          <Stack.Screen name="Alert" component={AlertScreen} />
+        </Stack.Navigator>
+      </NavigationContainer>
+    );
+  }
+
+--- FILE: App.js ---
+
+  import React, { useEffect } from 'react';
+  import RootNavigator, { navigationRef } from './src/navigation/RootNavigator';
+  import {
+    setupNotificationChannel,
+    registerForegroundHandler,
+    registerNotificationOpenHandlers,
+  } from './src/services/notificationService';
+
+  export default function App() {
+    useEffect(() => {
+      setupNotificationChannel();
+      const unsubForeground = registerForegroundHandler(navigationRef);
+      registerNotificationOpenHandlers(navigationRef);
+      return unsubForeground;
+    }, []);
+
+    return <RootNavigator />;
+  }
+
+================================================================================
+SECTION 12: SCREENS - FULL CODE
+================================================================================
+
+--- FILE: src/screens/SplashScreen.js ---
+
+  import React from 'react';
+  import { View, ActivityIndicator, StyleSheet } from 'react-native';
+
+  export default function SplashScreen() {
+    return (
+      <View style={styles.container}>
+        <ActivityIndicator size="large" color="#1a73e8" />
+      </View>
+    );
+  }
+
+  const styles = StyleSheet.create({
+    container: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: '#fff' },
+  });
+
+--- FILE: src/screens/PhoneSignInScreen.js ---
+
+  import React, { useState } from 'react';
+  import { View, Text, TextInput, TouchableOpacity, StyleSheet, Alert } from 'react-native';
+  import { sendOtp } from '../services/authService';
+  import { E164_REGEX } from '../config/constants';
+
+  export default function PhoneSignInScreen({ navigation }) {
+    const [phone, setPhone] = useState('');
+    const [loading, setLoading] = useState(false);
+
+    async function handleSend() {
+      if (!E164_REGEX.test(phone)) {
+        Alert.alert('Invalid number', 'Enter your phone number in international format, e.g. +2348012345678');
+        return;
+      }
+      setLoading(true);
+      try {
+        const confirmation = await sendOtp(phone);
+        navigation.navigate('OtpVerification', { phone, confirmation });
+      } catch (err) {
+        Alert.alert('Could not send code', err.message);
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    return (
+      <View style={styles.container}>
+        <Text style={styles.title}>Welcome to PSARS</Text>
+        <Text style={styles.subtitle}>Enter your phone number to continue</Text>
+        <TextInput
+          style={styles.input}
+          placeholder="+2348012345678"
+          keyboardType="phone-pad"
+          value={phone}
+          onChangeText={setPhone}
+        />
+        <TouchableOpacity style={styles.button} onPress={handleSend} disabled={loading}>
+          <Text style={styles.buttonText}>{loading ? 'Sending...' : 'Send code'}</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  const styles = StyleSheet.create({
+    container: { flex: 1, justifyContent: 'center', padding: 24, backgroundColor: '#fff' },
+    title: { fontSize: 24, fontWeight: '600', marginBottom: 8 },
+    subtitle: { fontSize: 14, color: '#5f6368', marginBottom: 24 },
+    input: { borderWidth: 1, borderColor: '#e0e0e0', borderRadius: 10, padding: 14, marginBottom: 16 },
+    button: { backgroundColor: '#1a73e8', borderRadius: 24, padding: 14, alignItems: 'center' },
+    buttonText: { color: '#fff', fontWeight: '600' },
+  });
+
+--- FILE: src/screens/OtpVerificationScreen.js ---
+
+  import React, { useState } from 'react';
+  import { View, Text, TextInput, TouchableOpacity, StyleSheet, Alert } from 'react-native';
+  import { confirmOtp, ensureUserDocument } from '../services/authService';
+
+  export default function OtpVerificationScreen({ route }) {
+    const { phone } = route.params;
+    const [code, setCode] = useState('');
+    const [loading, setLoading] = useState(false);
+
+    async function handleConfirm() {
+      setLoading(true);
+      try {
+        const user = await confirmOtp(code);
+        await ensureUserDocument({ uid: user.uid, phoneNumber: phone });
+        // RootNavigator's onAuthStateChanged listener takes it from here.
+      } catch (err) {
+        Alert.alert('Verification failed', err.message);
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    return (
+      <View style={styles.container}>
+        <Text style={styles.title}>Enter the code sent to {phone}</Text>
+        <TextInput
+          style={styles.input}
+          placeholder="123456"
+          keyboardType="number-pad"
+          value={code}
+          onChangeText={setCode}
+        />
+        <TouchableOpacity style={styles.button} onPress={handleConfirm} disabled={loading}>
+          <Text style={styles.buttonText}>{loading ? 'Verifying...' : 'Verify'}</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  const styles = StyleSheet.create({
+    container: { flex: 1, justifyContent: 'center', padding: 24, backgroundColor: '#fff' },
+    title: { fontSize: 18, fontWeight: '600', marginBottom: 24 },
+    input: { borderWidth: 1, borderColor: '#e0e0e0', borderRadius: 10, padding: 14, marginBottom: 16 },
+    button: { backgroundColor: '#1a73e8', borderRadius: 24, padding: 14, alignItems: 'center' },
+    buttonText: { color: '#fff', fontWeight: '600' },
+  });
+
+--- FILE: src/screens/ProfileSetupScreen.js ---
+
+  import React, { useState } from 'react';
+  import { View, Text, TextInput, TouchableOpacity, StyleSheet, Alert } from 'react-native';
+  import { completeProfile, currentUser } from '../services/authService';
+  import { requestPermissionsAndRegisterToken } from '../services/notificationService';
+
+  export default function ProfileSetupScreen() {
+    const [name, setName] = useState('');
+    const [loading, setLoading] = useState(false);
+
+    async function handleSave() {
+      if (!name.trim()) {
+        Alert.alert('Name required');
+        return;
+      }
+      setLoading(true);
+      try {
+        const uid = currentUser().uid;
+        await completeProfile(uid, name.trim());
+        await requestPermissionsAndRegisterToken(uid);
+      } catch (err) {
+        Alert.alert('Something went wrong', err.message);
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    return (
+      <View style={styles.container}>
+        <Text style={styles.title}>What should we call you?</Text>
+        <TextInput style={styles.input} placeholder="Full name" value={name} onChangeText={setName} />
+        <TouchableOpacity style={styles.button} onPress={handleSave} disabled={loading}>
+          <Text style={styles.buttonText}>{loading ? 'Saving...' : 'Continue'}</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  const styles = StyleSheet.create({
+    container: { flex: 1, justifyContent: 'center', padding: 24, backgroundColor: '#fff' },
+    title: { fontSize: 18, fontWeight: '600', marginBottom: 24 },
+    input: { borderWidth: 1, borderColor: '#e0e0e0', borderRadius: 10, padding: 14, marginBottom: 16 },
+    button: { backgroundColor: '#1a73e8', borderRadius: 24, padding: 14, alignItems: 'center' },
+    buttonText: { color: '#fff', fontWeight: '600' },
+  });
+
+--- FILE: src/screens/DevicePairingScreen.js ---
+
+  import React, { useState } from 'react';
+  import { View, Text, TextInput, TouchableOpacity, StyleSheet, Alert, Modal } from 'react-native';
+  import { CameraScreen } from 'react-native-camera-kit';
+  import { claimDevice } from '../services/deviceService';
+  import { currentUser } from '../services/authService';
+
+  export default function DevicePairingScreen() {
+    const [deviceId, setDeviceId] = useState('');
+    const [scanning, setScanning] = useState(false);
+    const [loading, setLoading] = useState(false);
+
+    async function handleClaim(idToClaim) {
+      const id = (idToClaim || deviceId).trim();
+      if (!id) return;
+      setLoading(true);
+      try {
+        await claimDevice(id, currentUser().uid);
+        // RootNavigator's profile listener will flip to the dashboard once
+        // users/{uid}.device_id updates.
+      } catch (err) {
+        Alert.alert('Could not connect device', err.message);
+      } finally {
+        setLoading(false);
+        setScanning(false);
+      }
+    }
+
+    return (
+      <View style={styles.container}>
+        <Text style={styles.title}>Connect your PSARS device</Text>
+        <Text style={styles.subtitle}>Scan the QR code on your unit, or enter its ID manually.</Text>
+
+        <TouchableOpacity style={styles.scanButton} onPress={() => setScanning(true)}>
+          <Text style={styles.scanButtonText}>Scan QR code</Text>
+        </TouchableOpacity>
+
+        <TextInput
+          style={styles.input}
+          placeholder="psars_node_01"
+          value={deviceId}
+          onChangeText={setDeviceId}
+          autoCapitalize="none"
+        />
+        <TouchableOpacity style={styles.button} onPress={() => handleClaim()} disabled={loading}>
+          <Text style={styles.buttonText}>{loading ? 'Connecting...' : 'Connect'}</Text>
+        </TouchableOpacity>
+
+        <Modal visible={scanning} animationType="slide">
+          <CameraScreen
+            scanBarcode
+            onReadCode={(event) => handleClaim(event.nativeEvent.codeStringValue)}
+            showFrame
+            laserColor="#1a73e8"
+            frameColor="#ffffff"
+          />
+          <TouchableOpacity style={styles.cancelScan} onPress={() => setScanning(false)}>
+            <Text style={styles.buttonText}>Cancel</Text>
+          </TouchableOpacity>
+        </Modal>
+      </View>
+    );
+  }
+
+  const styles = StyleSheet.create({
+    container: { flex: 1, justifyContent: 'center', padding: 24, backgroundColor: '#fff' },
+    title: { fontSize: 20, fontWeight: '600', marginBottom: 8 },
+    subtitle: { fontSize: 14, color: '#5f6368', marginBottom: 24 },
+    scanButton: { backgroundColor: '#e8f0fe', borderRadius: 24, padding: 14, alignItems: 'center', marginBottom: 24 },
+    scanButtonText: { color: '#1a73e8', fontWeight: '600' },
+    input: { borderWidth: 1, borderColor: '#e0e0e0', borderRadius: 10, padding: 14, marginBottom: 16 },
+    button: { backgroundColor: '#1a73e8', borderRadius: 24, padding: 14, alignItems: 'center' },
+    buttonText: { color: '#fff', fontWeight: '600' },
+    cancelScan: { padding: 20, alignItems: 'center', backgroundColor: '#000' },
+  });
+
+--- FILE: src/components/DeviceMapView.js ---
+
+  // Pure presentational live map: takes an already-fetched `device` object
+  // (from devices/{deviceId}) and renders it. Shared by HomeDashboardScreen
+  // (the owner), WatchedDeviceMapScreen (a linked emergency contact), and
+  // AlertScreen (opened from a push notification) - all three now read the
+  // exact same device document, just via different navigation entry points,
+  // thanks to firestore.rules granting read access to both the owner and
+  // any linked emergency contact.
+
+  import React from 'react';
+  import { View, Text, StyleSheet } from 'react-native';
+  import MapView, { Marker } from 'react-native-maps';
+  import PanicBanner from './PanicBanner';
+  import StatusPill from './StatusPill';
+
+  export default function DeviceMapView({ device, label }) {
+    const loc = device?.latest_location;
+    const isPanic = loc?.panic === true;
+
+    return (
+      <View style={styles.container}>
+        {isPanic && <PanicBanner />}
+        {label && (
+          <View style={styles.labelWrap}>
+            <Text style={styles.label}>{label}</Text>
+          </View>
+        )}
+
+        <View style={styles.mapWrap}>
+          {loc ? (
+            <MapView
+              style={StyleSheet.absoluteFill}
+              region={{
+                latitude: loc.latitude,
+                longitude: loc.longitude,
+                latitudeDelta: 0.01,
+                longitudeDelta: 0.01,
+              }}
+            >
+              <Marker
+                coordinate={{ latitude: loc.latitude, longitude: loc.longitude }}
+                pinColor={isPanic ? 'red' : 'blue'}
+              />
+            </MapView>
+          ) : (
+            <Text style={styles.waiting}>Waiting for the device's first location ping...</Text>
+          )}
+        </View>
+
+        <View style={styles.footer}>
+          <StatusPill lastSeen={device?.last_seen} battery={loc?.battery} />
+        </View>
+      </View>
+    );
+  }
+
+  const styles = StyleSheet.create({
+    container: { flex: 1, backgroundColor: '#fff' },
+    labelWrap: { padding: 12, borderBottomWidth: 1, borderBottomColor: '#f0f0f0' },
+    label: { fontSize: 13, color: '#5f6368' },
+    mapWrap: { flex: 1 },
+    waiting: { textAlign: 'center', marginTop: 40, color: '#5f6368' },
+    footer: { padding: 16, borderTopWidth: 1, borderTopColor: '#f0f0f0' },
+  });
+
+--- FILE: src/screens/HomeDashboardScreen.js ---
+
+  import React, { useEffect, useState } from 'react';
+  import { View, TouchableOpacity, Text, StyleSheet } from 'react-native';
+  import { listenToDevice } from '../services/deviceService';
+  import { currentUser } from '../services/authService';
+  import { firestore } from '../services/firebase';
+  import DeviceMapView from '../components/DeviceMapView';
+
+  export default function HomeDashboardScreen({ navigation }) {
+    const [device, setDevice] = useState(null);
+    const [deviceId, setDeviceId] = useState(null);
+
+    useEffect(() => {
+      const uid = currentUser().uid;
+      const unsubUser = firestore()
+        .collection('users')
+        .doc(uid)
+        .onSnapshot((snap) => setDeviceId(snap.data()?.device_id));
+      return unsubUser;
+    }, []);
+
+    useEffect(() => {
+      if (!deviceId) return;
+      return listenToDevice(deviceId, setDevice);
+    }, [deviceId]);
+
+    return (
+      <View style={styles.container}>
+        <DeviceMapView device={device} />
+        <TouchableOpacity style={styles.watchedLink} onPress={() => navigation.navigate('WatchedDevices')}>
+          <Text style={styles.watchedLinkText}>Devices I'm watching as a contact →</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  const styles = StyleSheet.create({
+    container: { flex: 1, backgroundColor: '#fff' },
+    watchedLink: { padding: 14, alignItems: 'center', borderTopWidth: 1, borderTopColor: '#f0f0f0' },
+    watchedLinkText: { color: '#1a73e8', fontSize: 13, fontWeight: '500' },
+  });
+
+--- FILE: src/screens/NoDeviceHomeScreen.js ---
+
+  // Shown to anyone who hasn't paired their own PSARS hardware unit yet.
+  // Being an emergency contact does NOT require owning a device, so this
+  // screen leads with "devices you're watching" and treats pairing your own
+  // unit as a secondary action - not everyone who opens this app owns
+  // hardware; some are only here because someone added them as a contact.
+
+  import React, { useEffect, useState } from 'react';
+  import { View, Text, FlatList, TouchableOpacity, StyleSheet } from 'react-native';
+  import { listenToWatchedDevices } from '../services/contactsService';
+  import { currentUser } from '../services/authService';
+
+  export default function NoDeviceHomeScreen({ navigation }) {
+    const [watched, setWatched] = useState([]);
+
+    useEffect(() => {
+      return listenToWatchedDevices(currentUser().uid, setWatched);
+    }, []);
+
+    return (
+      <View style={styles.container}>
+        <Text style={styles.title}>Devices you're watching</Text>
+        <FlatList
+          data={watched}
+          keyExtractor={(item) => item.deviceId}
+          renderItem={({ item }) => (
+            <TouchableOpacity
+              style={styles.row}
+              onPress={() => navigation.navigate('WatchedDeviceMap', { deviceId: item.deviceId })}
+            >
+              <Text style={styles.rowText}>{item.deviceId}</Text>
+            </TouchableOpacity>
+          )}
+          ListEmptyComponent={
+            <Text style={styles.empty}>No one has added you as an emergency contact yet.</Text>
+          }
+        />
+        <TouchableOpacity style={styles.button} onPress={() => navigation.navigate('DevicePairing')}>
+          <Text style={styles.buttonText}>Connect your own PSARS device</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  const styles = StyleSheet.create({
+    container: { flex: 1, padding: 24, backgroundColor: '#fff' },
+    title: { fontSize: 20, fontWeight: '600', marginBottom: 16 },
+    row: { paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: '#f0f0f0' },
+    rowText: { fontSize: 15 },
+    empty: { color: '#5f6368', marginTop: 20 },
+    button: { backgroundColor: '#1a73e8', borderRadius: 24, padding: 14, alignItems: 'center', marginTop: 24 },
+    buttonText: { color: '#fff', fontWeight: '600' },
+  });
+
+--- FILE: src/screens/WatchedDevicesListScreen.js ---
+
+  // Same watched-devices list as NoDeviceHomeScreen, but reachable from
+  // HomeDashboardScreen for a user who BOTH owns a device AND is separately
+  // listed as someone else's emergency contact.
+
+  import React, { useEffect, useState } from 'react';
+  import { View, Text, FlatList, TouchableOpacity, StyleSheet } from 'react-native';
+  import { listenToWatchedDevices } from '../services/contactsService';
+  import { currentUser } from '../services/authService';
+
+  export default function WatchedDevicesListScreen({ navigation }) {
+    const [watched, setWatched] = useState([]);
+
+    useEffect(() => {
+      return listenToWatchedDevices(currentUser().uid, setWatched);
+    }, []);
+
+    return (
+      <View style={styles.container}>
+        <FlatList
+          data={watched}
+          keyExtractor={(item) => item.deviceId}
+          contentContainerStyle={{ padding: 16 }}
+          renderItem={({ item }) => (
+            <TouchableOpacity
+              style={styles.row}
+              onPress={() => navigation.navigate('WatchedDeviceMap', { deviceId: item.deviceId })}
+            >
+              <Text style={styles.rowText}>{item.deviceId}</Text>
+            </TouchableOpacity>
+          )}
+          ListEmptyComponent={
+            <Text style={styles.empty}>No one has added you as an emergency contact yet.</Text>
+          }
+        />
+      </View>
+    );
+  }
+
+  const styles = StyleSheet.create({
+    container: { flex: 1, backgroundColor: '#fff' },
+    row: { paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: '#f0f0f0' },
+    rowText: { fontSize: 15 },
+    empty: { color: '#5f6368', marginTop: 20, textAlign: 'center' },
+  });
+
+--- FILE: src/screens/WatchedDeviceMapScreen.js ---
+
+  // Live, read-only view of a device the current user is an emergency
+  // contact for (not the owner). Works because firestore.rules now grants
+  // read access on devices/{deviceId} to any uid with a matching
+  // emergency_contacts/{uid} record underneath it.
+
+  import React, { useEffect, useState } from 'react';
+  import { listenToDevice } from '../services/deviceService';
+  import DeviceMapView from '../components/DeviceMapView';
+
+  export default function WatchedDeviceMapScreen({ route }) {
+    const { deviceId } = route.params;
+    const [device, setDevice] = useState(null);
+
+    useEffect(() => listenToDevice(deviceId, setDevice), [deviceId]);
+
+    return <DeviceMapView device={device} label={`Watching: ${deviceId}`} />;
+  }
+
+--- FILE: src/components/PanicBanner.js ---
+
+  import React from 'react';
+  import { View, Text, StyleSheet } from 'react-native';
+
+  export default function PanicBanner() {
+    return (
+      <View style={styles.banner}>
+        <Text style={styles.text}>PANIC ALERT ACTIVE</Text>
+      </View>
+    );
+  }
+
+  const styles = StyleSheet.create({
+    banner: { backgroundColor: '#d93025', padding: 14, alignItems: 'center' },
+    text: { color: '#fff', fontWeight: '700', letterSpacing: 0.5 },
+  });
+
+--- FILE: src/components/StatusPill.js ---
+
+  import React from 'react';
+  import { View, Text, StyleSheet } from 'react-native';
+
+  export default function StatusPill({ lastSeen, battery }) {
+    const seenDate = lastSeen?.toDate ? lastSeen.toDate() : null;
+    const isOnline = seenDate ? Date.now() - seenDate.getTime() < 5 * 60 * 1000 : false;
+
+    return (
+      <View style={styles.row}>
+        <View style={[styles.dot, { backgroundColor: isOnline ? '#1e8e3e' : '#dadce0' }]} />
+        <Text style={styles.text}>
+          {isOnline ? 'Online' : 'Offline'}
+          {battery != null ? ` · Battery ${battery}%` : ''}
+        </Text>
+      </View>
+    );
+  }
+
+  const styles = StyleSheet.create({
+    row: { flexDirection: 'row', alignItems: 'center' },
+    dot: { width: 8, height: 8, borderRadius: 4, marginRight: 8 },
+    text: { color: '#5f6368', fontSize: 13 },
+  });
+
+--- FILE: src/screens/LocationHistoryScreen.js ---
+
+  import React, { useEffect, useState } from 'react';
+  import { View, Text, FlatList, StyleSheet } from 'react-native';
+  import { listenToLocationHistory } from '../services/deviceService';
+  import { firestore } from '../services/firebase';
+  import { currentUser } from '../services/authService';
+
+  export default function LocationHistoryScreen() {
+    const [history, setHistory] = useState([]);
+
+    useEffect(() => {
+      let unsubHistory;
+      const unsubUser = firestore()
+        .collection('users')
+        .doc(currentUser().uid)
+        .onSnapshot((snap) => {
+          const deviceId = snap.data()?.device_id;
+          if (deviceId) unsubHistory = listenToLocationHistory(deviceId, setHistory);
+        });
+      return () => {
+        unsubUser();
+        unsubHistory && unsubHistory();
+      };
+    }, []);
+
+    return (
+      <FlatList
+        data={history}
+        keyExtractor={(item) => item.id}
+        contentContainerStyle={{ padding: 16 }}
+        renderItem={({ item }) => (
+          <View style={styles.row}>
+            <Text style={styles.coords}>{item.latitude.toFixed(5)}, {item.longitude.toFixed(5)}</Text>
+            <Text style={styles.meta}>
+              {item.timestamp?.toDate?.().toLocaleString() || '...'}
+              {item.panic ? '  ·  PANIC' : ''}
+            </Text>
+          </View>
+        )}
+      />
+    );
+  }
+
+  const styles = StyleSheet.create({
+    row: { paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: '#f0f0f0' },
+    coords: { fontSize: 15, fontWeight: '500' },
+    meta: { fontSize: 12, color: '#5f6368', marginTop: 2 },
+  });
+
+--- FILE: src/screens/EmergencyContactsScreen.js ---
+
+  import React, { useEffect, useState } from 'react';
+  import { View, FlatList, TouchableOpacity, Text, StyleSheet } from 'react-native';
+  import { listenToContacts, removeContact } from '../services/contactsService';
+  import { firestore } from '../services/firebase';
+  import { currentUser } from '../services/authService';
+  import ContactListItem from '../components/ContactListItem';
+
+  export default function EmergencyContactsScreen({ navigation }) {
+    const [contacts, setContacts] = useState([]);
+    const [deviceId, setDeviceId] = useState(null);
+
+    useEffect(() => {
+      return firestore()
+        .collection('users')
+        .doc(currentUser().uid)
+        .onSnapshot((snap) => setDeviceId(snap.data()?.device_id));
+    }, []);
+
+    useEffect(() => {
+      if (!deviceId) return;
+      return listenToContacts(deviceId, setContacts);
+    }, [deviceId]);
+
+    return (
+      <View style={styles.container}>
+        <FlatList
+          data={contacts}
+          keyExtractor={(item) => item.id}
+          contentContainerStyle={{ padding: 16 }}
+          renderItem={({ item }) => (
+            <ContactListItem
+              contact={item}
+              onRemove={() => removeContact(deviceId, item.id)}
+            />
+          )}
+          ListEmptyComponent={<Text style={styles.empty}>No emergency contacts yet.</Text>}
+        />
+        <TouchableOpacity
+          style={styles.addButton}
+          onPress={() => navigation.navigate('AddContact', { deviceId })}
+        >
+          <Text style={styles.addButtonText}>+ Add contact</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  const styles = StyleSheet.create({
+    container: { flex: 1, backgroundColor: '#fff' },
+    empty: { textAlign: 'center', color: '#5f6368', marginTop: 40 },
+    addButton: { backgroundColor: '#1a73e8', margin: 16, borderRadius: 24, padding: 14, alignItems: 'center' },
+    addButtonText: { color: '#fff', fontWeight: '600' },
+  });
+
+--- FILE: src/components/ContactListItem.js ---
+
+  import React from 'react';
+  import { View, Text, TouchableOpacity, StyleSheet } from 'react-native';
+
+  export default function ContactListItem({ contact, onRemove }) {
+    return (
+      <View style={styles.row}>
+        <View>
+          <Text style={styles.name}>{contact.name}</Text>
+          <Text style={styles.phone}>{contact.phone_number}</Text>
+          <Text style={styles.badge}>{contact.user_id ? 'App + SMS' : 'SMS only'}</Text>
+        </View>
+        <TouchableOpacity onPress={onRemove}>
+          <Text style={styles.remove}>Remove</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  const styles = StyleSheet.create({
+    row: {
+      flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
+      paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: '#f0f0f0',
+    },
+    name: { fontSize: 15, fontWeight: '500' },
+    phone: { fontSize: 13, color: '#5f6368', marginTop: 2 },
+    badge: { fontSize: 11, color: '#1a73e8', marginTop: 4 },
+    remove: { color: '#d93025', fontWeight: '600' },
+  });
+
+--- FILE: src/screens/AddContactScreen.js ---
+
+  import React, { useState } from 'react';
+  import { View, Text, TextInput, TouchableOpacity, StyleSheet, Alert } from 'react-native';
+  import { addContact } from '../services/contactsService';
+  import { E164_REGEX } from '../config/constants';
+
+  export default function AddContactScreen({ route, navigation }) {
+    const { deviceId } = route.params;
+    const [name, setName] = useState('');
+    const [phone, setPhone] = useState('');
+    const [loading, setLoading] = useState(false);
+
+    async function handleSave() {
+      if (!name.trim() || !E164_REGEX.test(phone)) {
+        Alert.alert('Check the fields', 'Enter a name and a valid phone number (e.g. +2348012345678).');
+        return;
+      }
+      setLoading(true);
+      try {
+        await addContact(deviceId, { name: name.trim(), phoneNumber: phone });
+        navigation.goBack();
+      } catch (err) {
+        Alert.alert('Could not add contact', err.message);
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    return (
+      <View style={styles.container}>
+        <Text style={styles.title}>Add emergency contact</Text>
+        <TextInput style={styles.input} placeholder="Name" value={name} onChangeText={setName} />
+        <TextInput
+          style={styles.input}
+          placeholder="+2348012345678"
+          keyboardType="phone-pad"
+          value={phone}
+          onChangeText={setPhone}
+        />
+        <TouchableOpacity style={styles.button} onPress={handleSave} disabled={loading}>
+          <Text style={styles.buttonText}>{loading ? 'Saving...' : 'Save contact'}</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  const styles = StyleSheet.create({
+    container: { flex: 1, padding: 24, backgroundColor: '#fff' },
+    title: { fontSize: 18, fontWeight: '600', marginBottom: 24 },
+    input: { borderWidth: 1, borderColor: '#e0e0e0', borderRadius: 10, padding: 14, marginBottom: 16 },
+    button: { backgroundColor: '#1a73e8', borderRadius: 24, padding: 14, alignItems: 'center' },
+    buttonText: { color: '#fff', fontWeight: '600' },
+  });
+
+--- FILE: src/screens/AlertScreen.js ---
+
+  // Opened by tapping a panic push notification. Starts from the static
+  // lat/lng the notification carried (so something renders instantly, even
+  // before Firestore responds), then immediately upgrades to a LIVE feed by
+  // subscribing to devices/{deviceId} - the same live map the owner sees,
+  // available here because firestore.rules grants read access to any linked
+  // emergency contact, not just the owner.
+
+  import React, { useEffect, useState } from 'react';
+  import { listenToDevice } from '../services/deviceService';
+  import DeviceMapView from '../components/DeviceMapView';
+
+  export default function AlertScreen({ route }) {
+    const { lat, lng, deviceId } = route.params || {};
+
+    const [device, setDevice] = useState({
+      latest_location: { latitude: lat, longitude: lng, panic: true },
+    });
+
+    useEffect(() => {
+      if (!deviceId) return;
+      return listenToDevice(deviceId, (liveDevice) => {
+        if (liveDevice) setDevice(liveDevice);
+      });
+    }, [deviceId]);
+
+    return <DeviceMapView device={device} label="Live panic alert" />;
+  }
+
+--- FILE: src/screens/SettingsScreen.js ---
+
+  import React from 'react';
+  import { View, Text, TouchableOpacity, StyleSheet } from 'react-native';
+  import { signOut } from '../services/authService';
+
+  export default function SettingsScreen() {
+    return (
+      <View style={styles.container}>
+        <TouchableOpacity style={styles.button} onPress={signOut}>
+          <Text style={styles.buttonText}>Sign out</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  const styles = StyleSheet.create({
+    container: { flex: 1, justifyContent: 'center', padding: 24, backgroundColor: '#fff' },
+    button: { backgroundColor: '#d93025', borderRadius: 24, padding: 14, alignItems: 'center' },
+    buttonText: { color: '#fff', fontWeight: '600' },
+  });
+
+================================================================================
+SECTION 13: FULL END-TO-END WORKFLOW
+================================================================================
+
+1. User opens app for the first time.
+   -> PhoneSignInScreen -> sendOtp() -> OtpVerificationScreen -> confirmOtp()
+   -> ensureUserDocument() creates users/{uid} with device_id: null.
+
+2. RootNavigator sees profile.full_name is empty -> ProfileSetupScreen.
+   -> completeProfile() sets full_name.
+   -> requestPermissionsAndRegisterToken() gets an FCM token and saves it
+      to users/{uid}.fcm_token. From this point on, if this user is ever
+      added as someone else's emergency contact by phone number, the
+      backfillContactOnSignup Cloud Function upgrades that contact record
+      automatically - the device owner does nothing.
+
+3. RootNavigator sees profile.device_id is null -> DevicePairingScreen.
+   -> User scans the QR code printed on their PSARS hardware unit (or
+      types the device_id manually) -> claimDevice().
+   -> claimDevice() calls .create() on devices/{deviceId}. Firestore rules
+      allow this ONLY if no document exists yet at that path. If someone
+      else already claimed it, the create is rejected with
+      firestore/permission-denied, surfaced to the user as
+      "This device is already connected to another account."
+   -> On success, users/{uid}.device_id is set, flipping RootNavigator to
+      the main app.
+
+4. HomeDashboardScreen subscribes to devices/{deviceId} in real time.
+   Every telemetry ping the ESP32 sends to the FastAPI backend updates
+   latest_location here, which updates the map instantly. If panic is
+   true, PanicBanner renders and (separately) every contact in
+   emergency_contacts has already received a push/SMS from the backend at
+   the same time this write happened.
+
+5. EmergencyContactsScreen / AddContactScreen let the owner manage who
+   gets alerted. Adding a contact with a phone number that already
+   belongs to a PSARS account immediately links user_id + fcm_token; a
+   contact without an account gets SMS-only until they sign up later
+   (handled transparently by backfillContactOnSignup).
+
+6. When a panic event fires on the backend, every contact with an
+   fcm_token receives a push. Tapping it (app foreground, background, or
+   killed - all three paths are wired in notificationService.js and
+   index.js) opens AlertScreen, which shows the notification's lat/lng
+   instantly and then upgrades to a LIVE Firestore feed of the device the
+   moment it connects - the map keeps updating in real time for as long as
+   the contact stays on that screen.
+
+7. A linked contact doesn't have to wait for a panic push to check in.
+   NoDeviceHomeScreen (if they don't own a device themselves) or
+   HomeDashboardScreen's "Devices I'm watching" link (if they do) lists
+   every device they're a contact on, via listenToWatchedDevices() - a
+   collectionGroup query across all devices' emergency_contacts
+   subcollections, filtered server-side by firestore.rules to only their
+   own record. Tapping an entry opens WatchedDeviceMapScreen, the same
+   live map, at any time - not just during an active alert.
+
+================================================================================
+SECTION 14: TESTING CHECKLIST
+================================================================================
+
+  [ ] Phone sign-in sends and verifies an OTP on a real device (Firebase
+      Phone Auth SMS does not work reliably in the Android emulator without
+      Google Play services + a test phone number configured in console).
+  [ ] users/{uid} document is created after first sign-in.
+  [ ] fcm_token is present on users/{uid} after ProfileSetupScreen.
+  [ ] Claiming a device_id that doesn't exist yet succeeds.
+  [ ] Claiming a device_id that's already owned by a different account
+      fails with the expected "already connected" message.
+  [ ] Dashboard map updates live when the FastAPI backend receives a new
+      telemetry POST for the claimed device.
+  [ ] Adding a contact whose phone number matches an existing PSARS
+      account immediately shows "App + SMS" in the contact list.
+  [ ] Adding a contact by a brand-new phone number shows "SMS only", then
+      flips to "App + SMS" automatically once that number signs up
+      (tests backfillContactOnSignup end-to-end).
+  [ ] Triggering a panic telemetry event delivers a push to every
+      contact's device, in foreground, background, and killed app states.
+  [ ] Tapping the push notification opens AlertScreen with the correct
+      coordinates in all three app states above.
+  [ ] A linked contact (account already existed when added) can open
+      "Devices I'm watching" and see the owner's live map update in real
+      time as new telemetry arrives - independent of any push notification.
+  [ ] A contact added by phone number only (no account yet) does NOT show
+      up in anyone's watched-devices list; after they sign up with that
+      same number, they appear automatically and can view the live map,
+      with no action taken by the device owner.
+  [ ] A user who is NOT a linked contact and does NOT own the device gets
+      a permission-denied error attempting to read it directly (confirms
+      the rule is actually scoped, not open to any authenticated user).
+
+================================================================================
+SECTION 15: DEPENDENCY VERSION NOTES
+================================================================================
+
+All @react-native-firebase packages MUST be installed at the same major
+version - do not mix e.g. auth@21.x with firestore@20.x. Run
+`npm ls @react-native-firebase/app` after installing to confirm a single
+resolved version across all of them, and re-run
+`npm install @react-native-firebase/app@latest @react-native-firebase/auth@latest @react-native-firebase/firestore@latest @react-native-firebase/messaging@latest`
+together if they ever drift.
+
+================================================================================
+SECTION 16: KNOWN LIMITATIONS / FUTURE WORK
+================================================================================
+
+1. Live contact viewing is now implemented (rules + backfill function
+   deployed, RN screens in Section 12). One real edge case remains: this
+   only re-keys emergency_contacts records going forward. If contacts were
+   added to a device BEFORE this fix shipped, their record may still sit
+   under an old auto-generated document ID even though user_id is already
+   set - the isLinkedContact() rule check requires the doc ID itself to
+   equal their uid, not just the user_id field, so a pre-existing record
+   like that won't grant read access until it's re-keyed. A one-off
+   migration script (query every emergency_contacts doc with a non-null
+   user_id whose doc ID != user_id, and re-key it the same way
+   backfillContactOnSignup does) would close this for any data that predates
+   the fix - not needed for a fresh deployment, since every contact added
+   from here on is keyed correctly at creation or at signup-backfill time.
+
+2. One device per user. users/{uid}.device_id is a single field, so the
+   current design does not support one account managing multiple PSARS
+   units. If that's needed later, this becomes an array or a subcollection
+   on the user doc instead, and DevicePairingScreen/HomeDashboardScreen
+   need a device switcher.
+
+3. Termii SMS still requires a sender ID to be registered and approved in
+   the Termii dashboard for the `dnd` channel before real SMS delivery
+   works - unrelated to the mobile app, but alerts will silently only
+   arrive via push until that's done.
+
+4. Phone Auth on Android release builds requires the release keystore's
+   SHA-1/SHA-256 fingerprints added in the Firebase console (Section 4) -
+   easy to forget and a common source of "works in debug, breaks in
+   release" bugs.
+
+================================================================================
+END OF DOCUMENT
+================================================================================

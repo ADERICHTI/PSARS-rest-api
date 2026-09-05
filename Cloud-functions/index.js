@@ -33,6 +33,14 @@ exports.syncFcmTokenToContacts = onDocumentUpdated("users/{userId}", async (even
 // existing SMS-only emergency contact somewhere. If it does, upgrade that
 // contact record with the new user's id + fcm_token so they start receiving
 // push alerts too, with no action needed from whoever added them.
+//
+// The record is also re-keyed so its document ID equals the new user's uid
+// (Firestore doc IDs can't be renamed in place, so this is a set-at-new-path
+// + delete-old-path pair within the same batch). This matters beyond just
+// consistency: firestore.rules grants a contact read access to a device via
+// exists(.../emergency_contacts/{request.auth.uid}) - that check only
+// passes once the contact's own record actually lives at that uid-keyed
+// path, which is exactly what this backfill now guarantees.
 exports.backfillContactOnSignup = onDocumentCreated("users/{userId}", async (event) => {
   const newUser = event.data.data();
   const phoneNumber = newUser.phone_number;
@@ -49,10 +57,18 @@ exports.backfillContactOnSignup = onDocumentCreated("users/{userId}", async (eve
 
   const batch = db.batch();
   contactsSnap.forEach((doc) => {
-    batch.update(doc.ref, {
+    const updatedData = {
+      ...doc.data(),
       user_id: userId,
       fcm_token: newUser.fcm_token || null,
-    });
+    };
+
+    if (doc.id === userId) {
+      batch.update(doc.ref, updatedData);
+    } else {
+      batch.set(doc.ref.parent.doc(userId), updatedData);
+      batch.delete(doc.ref);
+    }
   });
   await batch.commit();
 });

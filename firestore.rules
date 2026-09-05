@@ -3,6 +3,19 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    function isOwner(deviceId) {
+      return get(/databases/$(database)/documents/devices/$(deviceId)).data.owner_user_id == request.auth.uid;
+    }
+
+    // True only once an emergency contact record exists whose document ID
+    // is this user's own uid. Contacts added while they already had an
+    // account are keyed this way immediately (contactsService.addContact);
+    // contacts added before they had an account are re-keyed to their uid
+    // by the backfillContactOnSignup Cloud Function the moment they sign up.
+    function isLinkedContact(deviceId) {
+      return exists(/databases/$(database)/documents/devices/$(deviceId)/emergency_contacts/$(request.auth.uid));
+    }
+
     match /devices/{deviceId} {
       // Claim: only when the device has no owner yet (doc doesn't exist), and only
       // as yourself. First write to a given deviceId wins; a racing second claim
@@ -11,28 +24,32 @@ service cloud.firestore {
         && request.resource.data.owner_user_id == request.auth.uid;
 
       // Only the owner can modify their own device (e.g. emergency_contacts list).
-      allow update: if request.auth != null
-        && resource.data.owner_user_id == request.auth.uid;
+      allow update: if request.auth != null && isOwner(deviceId);
 
-      // Only the owner can read their device's data from the client.
+      // The owner can always read their device. A linked emergency contact can
+      // read it too, so their app can show the same live map during/after a
+      // panic alert - but cannot write to it.
       allow read: if request.auth != null
-        && resource.data.owner_user_id == request.auth.uid;
+        && (isOwner(deviceId) || isLinkedContact(deviceId));
 
       allow delete: if false;
 
-      // Emergency contacts: only the owner can view/manage their own device's
-      // contact list from the client. Cloud Functions use the admin SDK and
-      // bypass these rules entirely when syncing fcm_token values.
+      // Emergency contacts: the owner can read/manage the full list. A contact
+      // can read only their own record (either by knowing their own uid as the
+      // doc ID, or via a collectionGroup query matched by user_id) - this is
+      // what lets the app discover "which devices am I a contact for."
       match /emergency_contacts/{contactId} {
-        allow read, write: if request.auth != null
-          && get(/databases/$(database)/documents/devices/$(deviceId)).data.owner_user_id == request.auth.uid;
+        allow read: if request.auth != null
+          && (isOwner(deviceId) || contactId == request.auth.uid || resource.data.user_id == request.auth.uid);
+        allow write: if request.auth != null && isOwner(deviceId);
       }
 
       // Historical location pings: written only by the backend (admin SDK bypasses
-      // rules entirely), readable client-side only by the owning user.
+      // rules entirely). Readable by the owner and by linked emergency contacts,
+      // same as the device doc itself.
       match /locations/{locationId} {
         allow read: if request.auth != null
-          && get(/databases/$(database)/documents/devices/$(deviceId)).data.owner_user_id == request.auth.uid;
+          && (isOwner(deviceId) || isLinkedContact(deviceId));
         allow write: if false;
       }
     }
