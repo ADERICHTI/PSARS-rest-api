@@ -1,0 +1,38 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    match /devices/{deviceId} {
+      // Claim: only when the device has no owner yet (doc doesn't exist), and only
+      // as yourself. First write to a given deviceId wins; a racing second claim
+      // arrives as an update (doc now exists) and fails the owner check below.
+      allow create: if request.auth != null
+        && request.resource.data.owner_user_id == request.auth.uid;
+
+      // Only the owner can modify their own device (e.g. emergency_contacts list).
+      allow update: if request.auth != null
+        && resource.data.owner_user_id == request.auth.uid;
+
+      // Only the owner can read their device's data from the client.
+      allow read: if request.auth != null
+        && resource.data.owner_user_id == request.auth.uid;
+
+      allow delete: if false;
+
+      // Historical location pings: written only by the backend (admin SDK bypasses
+      // rules entirely), readable client-side only by the owning user.
+      match /locations/{locationId} {
+        allow read: if request.auth != null
+          && get(/databases/$(database)/documents/devices/$(deviceId)).data.owner_user_id == request.auth.uid;
+        allow write: if false;
+      }
+    }
+
+    match /users/{userId} {
+      allow read, update: if request.auth != null && request.auth.uid == userId;
+      allow create: if request.auth != null && request.auth.uid == userId;
+      allow delete: if false;
+    }
+  }
+}
